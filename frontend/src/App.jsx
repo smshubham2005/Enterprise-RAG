@@ -23,6 +23,26 @@ function formatBytes(sizeBytes) {
   return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
 }
 
+function isPdfFile(file) {
+  if (!file) return false
+
+  const fileName = file.name?.toLowerCase() || ''
+  const fileType = file.type?.toLowerCase() || ''
+
+  return fileName.endsWith('.pdf') || fileType === 'application/pdf' || fileType === 'application/x-pdf'
+}
+
+async function readJsonSafely(response) {
+  const text = await response.text()
+  if (!text) return null
+
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 const Icon = {
   Mark: (p) => (
     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.6" {...p}>
@@ -84,11 +104,14 @@ function App() {
   const [activeSources, setActiveSources] = useState(null)
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [loadingMessage, setLoadingMessage] = useState('Searching documents...')
   const [documents, setDocuments] = useState([])
   const [documentError, setDocumentError] = useState('')
   const [isDocumentsLoading, setIsDocumentsLoading] = useState(true)
   const [selectedFile, setSelectedFile] = useState(null)
   const [uploadMessage, setUploadMessage] = useState('')
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploadStatus, setUploadStatus] = useState('idle')
   const [isUploading, setIsUploading] = useState(false)
   const [deletingDocument, setDeletingDocument] = useState('')
   const [isAtBottom, setIsAtBottom] = useState(true)
@@ -96,9 +119,10 @@ function App() {
   const chatEndRef = useRef(null)
   const chatMessagesRef = useRef(null)
   const textareaRef = useRef(null)
+  const fileInputRef = useRef(null)
 
   const canSubmit = query.trim().length > 0 && !isLoading
-  const canUpload = selectedFile && !isUploading
+  const canUpload = !!selectedFile && !isUploading
   const totalChunks = documents.reduce((total, document) => total + document.chunk_count, 0)
   const indexedDocumentCount = documents.filter((document) => document.indexed).length
 
@@ -147,14 +171,15 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: loginUser, password: loginPass }),
       })
-      const payload = await response.json()
-      if (!response.ok) throw new Error(payload.detail || 'Login failed')
+      const payload = await readJsonSafely(response)
+      if (!response.ok) throw new Error(payload?.detail || 'Login failed')
       localStorage.setItem('rag_token', payload.access_token)
       localStorage.setItem('rag_username', payload.username)
       setToken(payload.access_token)
       setUsername(payload.username)
     } catch (err) {
-      setLoginError(err.message)
+      const message = err instanceof Error ? err.message : 'Unable to sign in right now.'
+      setLoginError(message === 'Failed to fetch' ? 'The sign-in service is unavailable right now. Please try again.' : message)
     }
   }
 
@@ -175,51 +200,159 @@ function App() {
       const response = await fetch(`${API_BASE_URL}/documents`, {
         headers: { Authorization: `Bearer ${token}` },
       })
-      const payload = await response.json()
+      const payload = await readJsonSafely(response)
       if (!response.ok) {
         if (response.status === 401) handleLogout()
-        throw new Error(payload.detail || 'Could not load documents.')
+        throw new Error(payload?.detail || 'Could not load documents.')
       }
-      setDocuments(payload.documents)
+      setDocuments(payload?.documents || [])
     } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : 'Could not load documents.'
       setDocuments([])
-      setDocumentError(requestError.message)
+      setDocumentError(message === 'Failed to fetch' ? 'The document service is unavailable right now. Please try again.' : message)
     } finally {
       setIsDocumentsLoading(false)
     }
+  }
+
+  function handleFileSelection(file) {
+    if (!file) {
+      setSelectedFile(null)
+      setUploadStatus('idle')
+      setUploadMessage('')
+      setUploadProgress(0)
+      return
+    }
+
+    if (!isPdfFile(file)) {
+      setSelectedFile(null)
+      setUploadStatus('invalid-file')
+      setUploadMessage('Please choose a valid PDF file.')
+      setDocumentError('')
+      setUploadProgress(0)
+      return
+    }
+
+    setSelectedFile(file)
+    setUploadStatus('idle')
+    setUploadMessage(`Selected ${file.name}`)
+    setDocumentError('')
+    setUploadProgress(0)
+  }
+
+  function handleFileInputChange(event) {
+    const file = event.target.files?.[0] || null
+    handleFileSelection(file)
+  }
+
+  function handleDropZoneDragOver(event) {
+    event.preventDefault()
+    if (!isUploading) {
+      setUploadStatus('drag-over')
+    }
+  }
+
+  function handleDropZoneDrop(event) {
+    event.preventDefault()
+    if (isUploading) return
+
+    setUploadStatus('idle')
+    const file = event.dataTransfer.files?.[0] || null
+    handleFileSelection(file)
+  }
+
+  function handleDropZoneDragLeave(event) {
+    event.preventDefault()
+    if (!isUploading) {
+      setUploadStatus('idle')
+    }
+  }
+
+  function openFilePicker() {
+    fileInputRef.current?.click()
   }
 
   async function uploadDocument(event) {
     event.preventDefault()
     if (!canUpload) return
 
+    const fileToUpload = selectedFile
+    if (!fileToUpload || !isPdfFile(fileToUpload)) {
+      setUploadStatus('invalid-file')
+      setUploadMessage('Please choose a valid PDF file.')
+      setDocumentError('')
+      return
+    }
+
     const formData = new FormData()
-    formData.append('file', selectedFile)
+    formData.append('file', fileToUpload)
 
     setIsUploading(true)
+    setUploadProgress(0)
+    setUploadStatus('uploading')
     setUploadMessage('')
     setDocumentError('')
 
-    try {
-      const response = await fetch(`${API_BASE_URL}/documents/upload`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        body: formData,
-      })
-      const payload = await response.json()
-      if (!response.ok) {
-        if (response.status === 401) handleLogout()
-        throw new Error(payload.detail || 'Upload failed.')
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API_BASE_URL}/documents/upload`)
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        const progressPercentage = Math.round((event.loaded / event.total) * 100)
+        setUploadProgress(progressPercentage)
       }
-      setUploadMessage(`${payload.filename} indexed into ${payload.chunk_count} chunks.`)
-      setSelectedFile(null)
-      event.target.reset()
-      await refreshDocuments()
-    } catch (requestError) {
-      setDocumentError(requestError.message)
-    } finally {
+    }
+
+    xhr.onload = async () => {
+      try {
+        let payload = null
+        try {
+          payload = JSON.parse(xhr.responseText || 'null')
+        } catch {
+          payload = null
+        }
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          setUploadProgress(100)
+          setUploadStatus('success')
+          setUploadMessage(`${payload?.filename || fileToUpload.name} indexed into ${payload?.chunk_count || 0} chunks.`)
+          setSelectedFile(null)
+          if (fileInputRef.current) {
+            fileInputRef.current.value = ''
+          }
+          await refreshDocuments()
+        } else {
+          if (xhr.status === 401) handleLogout()
+          const message = payload?.detail || 'Upload failed.'
+          setUploadStatus('error')
+          setDocumentError(message === 'Failed to fetch' ? 'The upload service is unavailable right now. Please try again.' : message)
+          setUploadMessage('')
+        }
+      } catch (requestError) {
+        setUploadStatus('error')
+        setDocumentError('The upload service is unavailable right now. Please try again.')
+        setUploadMessage('')
+      } finally {
+        setIsUploading(false)
+      }
+    }
+
+    xhr.onerror = () => {
+      setUploadStatus('error')
+      setDocumentError('The upload service is unavailable right now. Please try again.')
+      setUploadMessage('')
       setIsUploading(false)
     }
+
+    xhr.onabort = () => {
+      setUploadStatus('error')
+      setDocumentError('Upload cancelled.')
+      setUploadMessage('')
+      setIsUploading(false)
+    }
+
+    xhr.send(formData)
   }
 
   async function deleteDocument(id, filename) {
@@ -235,16 +368,17 @@ function App() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       })
-      const payload = await response.json()
+      const payload = await readJsonSafely(response)
       if (!response.ok) {
         if (response.status === 401) handleLogout()
-        throw new Error(payload.detail || 'Delete failed.')
+        throw new Error(payload?.detail || 'Delete failed.')
       }
       setActiveSources(null)
-      setUploadMessage(payload.message || `${filename} deleted successfully.`)
+      setUploadMessage(payload?.message || `${filename} deleted successfully.`)
       await refreshDocuments()
     } catch (requestError) {
-      setDocumentError(requestError.message)
+      const message = requestError instanceof Error ? requestError.message : 'Delete failed.'
+      setDocumentError(message === 'Failed to fetch' ? 'The delete service is unavailable right now. Please try again.' : message)
     } finally {
       setDeletingDocument('')
     }
@@ -260,6 +394,7 @@ function App() {
     setIsAtBottom(true)
     setMessages((prev) => [...prev, { role: 'user', content: userQuery }])
     setIsLoading(true)
+    setLoadingMessage('Searching documents and drafting an answer...')
     setError('')
 
     requestAnimationFrame(() => textareaRef.current?.focus())
@@ -273,14 +408,15 @@ function App() {
         },
         body: JSON.stringify({ query: userQuery, top_k: topK, history: historyPayload }),
       })
-      const payload = await response.json()
+      const payload = await readJsonSafely(response)
       if (!response.ok) {
         if (response.status === 401) handleLogout()
-        throw new Error(payload.detail || 'The assistant could not answer right now.')
+        throw new Error(payload?.detail || 'The assistant could not answer right now.')
       }
-      setMessages((prev) => [...prev, { role: 'assistant', content: payload.answer, sources: payload.sources }])
+      setMessages((prev) => [...prev, { role: 'assistant', content: payload?.answer || 'I could not generate a response right now.', sources: payload?.sources || [] }])
     } catch (requestError) {
-      setError(requestError.message)
+      const message = requestError instanceof Error ? requestError.message : 'The assistant could not answer right now.'
+      setError(message === 'Failed to fetch' ? 'The assistant is temporarily unavailable. Please try again in a moment.' : message)
       setMessages((prev) => prev.slice(0, -1))
       setQuery(userQuery)
     } finally {
@@ -355,12 +491,59 @@ function App() {
 
             <form className="upload-form" onSubmit={uploadDocument}>
               <label htmlFor="document-upload">Upload PDF</label>
-              <input id="document-upload" type="file" accept="application/pdf,.pdf" onChange={(event) => setSelectedFile(event.target.files?.[0] || null)} />
-              <button type="submit" disabled={!canUpload}><Icon.Upload /> {isUploading ? 'Indexing...' : 'Upload & index'}</button>
+              <div
+                className={`upload-dropzone ${uploadStatus}`}
+                onDragOver={handleDropZoneDragOver}
+                onDragEnter={handleDropZoneDragOver}
+                onDragLeave={handleDropZoneDragLeave}
+                onDrop={handleDropZoneDrop}
+                onClick={openFilePicker}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    openFilePicker()
+                  }
+                }}
+              >
+                <div className="upload-dropzone-icon" aria-hidden="true"><Icon.Upload /></div>
+                <div className="upload-dropzone-copy">
+                  <p className="upload-dropzone-title">
+                    {uploadStatus === 'drag-over' && 'Drop your PDF here'}
+                    {uploadStatus === 'uploading' && 'Uploading PDF…'}
+                    {uploadStatus === 'success' && 'Upload complete'}
+                    {uploadStatus === 'error' && 'Upload failed'}
+                    {uploadStatus === 'invalid-file' && 'Invalid file'}
+                    {uploadStatus === 'idle' && (selectedFile ? 'Ready to upload' : 'Drop a PDF here or choose a file')}
+                  </p>
+                  <p className="upload-dropzone-subtitle">
+                    {selectedFile ? selectedFile.name : 'Choose a PDF to index into the knowledge base.'}
+                  </p>
+                </div>
+                <div className="upload-dropzone-actions">
+                  <button type="button" className="upload-choose-btn" onClick={(event) => { event.stopPropagation(); openFilePicker() }}>Choose File</button>
+                  <button type="submit" className="upload-submit-btn" disabled={!canUpload}><Icon.Upload /> {isUploading ? 'Indexing...' : 'Upload & index'}</button>
+                </div>
+                {isUploading && (
+                  <div className="upload-progress-block" aria-live="polite">
+                    <div className="upload-progress-meta">
+                      <span>Uploading {selectedFile?.name || 'document'}…</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <div className="upload-progress-bar">
+                      <span style={{ width: `${uploadProgress}%` }} />
+                    </div>
+                  </div>
+                )}
+              </div>
+              <input ref={fileInputRef} id="document-upload" type="file" accept="application/pdf,.pdf" className="upload-file-input" onChange={handleFileInputChange} />
             </form>
 
-            {uploadMessage && <div className="success-box">{uploadMessage}</div>}
-            {documentError && <div className="error-box compact" role="alert">{documentError}</div>}
+            {uploadStatus === 'success' && uploadMessage && <div className="success-box">{uploadMessage}</div>}
+            {uploadStatus === 'error' && documentError && <div className="error-box compact" role="alert">{documentError}</div>}
+            {uploadStatus === 'invalid-file' && uploadMessage && <div className="error-box compact" role="alert">{uploadMessage}</div>}
+            {uploadStatus === 'idle' && !uploadMessage && !documentError && selectedFile && <div className="success-box">Selected {selectedFile.name}</div>}
 
             <div className="document-stats" aria-label="Document statistics">
               <span className="stat-figure"><strong>{indexedDocumentCount}</strong> indexed</span>
@@ -459,10 +642,15 @@ function App() {
             ))}
 
             {isLoading && (
-              <div className="chat-bubble-container assistant thinking">
+              <div className="chat-bubble-container assistant thinking" aria-live="polite">
                 <div className="chat-bubble thinking-bubble">
                   <span className="bubble-role">Assistant</span>
-                  <div className="thinking-status">Searching documents...</div>
+                  <div className="thinking-status">{loadingMessage}</div>
+                  <div className="loading-skeleton" aria-hidden="true">
+                    <div className="loading-line short" />
+                    <div className="loading-line" />
+                    <div className="loading-line medium" />
+                  </div>
                   <div className="typing-indicator"><span></span><span></span><span></span></div>
                 </div>
               </div>
@@ -492,7 +680,7 @@ function App() {
                   </label>
                   <div className="composer-actions">
                     <span className="composer-hint">Enter to send, Shift+Enter for newline</span>
-                    <button type="submit" disabled={!canSubmit}>{isLoading ? 'Thinking...' : <><Icon.Send /> Send</>}</button>
+                    <button type="submit" disabled={!canSubmit}>{isLoading ? 'Generating...' : <><Icon.Send /> Send</>}</button>
                   </div>
                 </div>
               </div>
