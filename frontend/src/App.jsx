@@ -513,11 +513,16 @@ function App() {
                 onDragEnter={handleDropZoneDragOver}
                 onDragLeave={handleDropZoneDragLeave}
                 onDrop={handleDropZoneDrop}
-                onClick={openFilePicker}
+                onClick={(e) => {
+                  // Only open picker if clicking the empty dropzone area, not when already selected or on actions
+                  if (!selectedFile && !isUploading) {
+                    openFilePicker()
+                  }
+                }}
                 role="button"
                 tabIndex={0}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
+                  if ((event.key === 'Enter' || event.key === ' ') && !selectedFile && !isUploading) {
                     event.preventDefault()
                     openFilePicker()
                   }
@@ -527,19 +532,19 @@ function App() {
                 <div className="upload-dropzone-copy">
                   <p className="upload-dropzone-title">
                     {uploadStatus === 'drag-over' && 'Drop your PDF here'}
-                    {uploadStatus === 'uploading' && 'Uploading PDF…'}
+                    {uploadStatus === 'uploading' && 'Uploading & indexing PDF…'}
                     {uploadStatus === 'success' && 'Upload complete'}
                     {uploadStatus === 'error' && 'Upload failed'}
                     {uploadStatus === 'invalid-file' && 'Invalid file'}
-                    {uploadStatus === 'idle' && (selectedFile ? 'Ready to upload' : 'Drop a PDF here or choose a file')}
+                    {uploadStatus === 'idle' && (selectedFile ? 'File selected' : 'Drop a PDF here or choose a file')}
                   </p>
                   <p className="upload-dropzone-subtitle">
                     {selectedFile ? selectedFile.name : 'Choose a PDF to index into the knowledge base.'}
                   </p>
                 </div>
-                <div className="upload-dropzone-actions">
+                <div className="upload-dropzone-actions" onClick={(e) => e.stopPropagation()}>
                   <button type="button" className="upload-choose-btn" onClick={(event) => { event.stopPropagation(); openFilePicker() }}>Choose File</button>
-                  <button type="submit" className="upload-submit-btn" disabled={!canUpload}><Icon.Upload /> {isUploading ? 'Indexing...' : 'Upload & index'}</button>
+                  <button type="submit" className="upload-submit-btn" disabled={!canUpload} onClick={(e) => e.stopPropagation()}><Icon.Upload /> {isUploading ? 'Indexing...' : 'Upload & index'}</button>
                 </div>
                 {isUploading && (
                   <div className="upload-progress-block" aria-live="polite">
