@@ -20,7 +20,6 @@ _detected_dimension: int | None = None
 # ==============================================================
 
 def get_detected_dimension() -> int:
-    """Measure the exact dimension output by the configured embedding model."""
     global _detected_dimension
     if _detected_dimension is None:
         settings = get_settings()
@@ -103,7 +102,6 @@ def _ensure_index_exists() -> None:
 
     if settings.pinecone_index_name in existing_indexes:
         existing_info = existing_indexes[settings.pinecone_index_name]
-        # If dimension mismatch, delete and recreate with matching dimension
         if existing_info.dimension != target_dim:
             logger.warning(
                 "Pinecone index dimension mismatch (found %d, model outputs %d). Recreating index...",
@@ -153,9 +151,13 @@ def store_documents(
     texts = [chunk.page_content for chunk in chunks]
     embeddings = get_gemini_embeddings(texts)
 
+    pages = []
     vectors_to_upsert = []
     for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
         page = chunk.metadata.get("page")
+        if isinstance(page, int):
+            pages.append(page)
+            
         vector_id = chunk.metadata.get("chunk_id") or f"{document_id}_p{page or 1}_c{idx}"
         
         metadata = {
@@ -174,17 +176,36 @@ def store_documents(
             "metadata": metadata,
         })
 
+    # Add a dedicated Catalog Manifest Vector for instant, bulletproof listing
+    manifest_id = f"__catalog__{document_id}"
+    unique_pages = sorted(list(set(pages)))
+    manifest_meta = {
+        "is_catalog_manifest": True,
+        "document_id": document_id,
+        "source_file": filename,
+        "storage_filename": storage_filename,
+        "chunk_count": len(chunks),
+        "pages_csv": ",".join(str(p) for p in unique_pages),
+        "size_bytes": size_bytes,
+    }
+    # Manifest uses first embedding vector values so it adheres to index dimensions
+    vectors_to_upsert.append({
+        "id": manifest_id,
+        "values": embeddings[0] if embeddings else [0.0] * get_detected_dimension(),
+        "metadata": manifest_meta,
+    })
+
     # Upsert in batches of 100
     for i in range(0, len(vectors_to_upsert), 100):
         index.upsert(vectors=vectors_to_upsert[i : i + 100])
 
-    return len(vectors_to_upsert)
+    return len(chunks)
 
 
 def delete_document(document_id: str) -> str | None:
     index = get_index()
     storage_filename: str | None = None
-    ids_to_delete: list[str] = []
+    ids_to_delete: list[str] = [f"__catalog__{document_id}"]
 
     for id_batch in index.list(prefix=document_id):
         if not storage_filename and id_batch:
@@ -193,8 +214,11 @@ def delete_document(document_id: str) -> str | None:
                 storage_filename = (vec.metadata or {}).get("storage_filename")
         ids_to_delete.extend(id_batch)
 
-    if not ids_to_delete:
-        return None
+    if len(ids_to_delete) <= 1:
+        # Check if manifest exists
+        fetch_manifest = index.fetch(ids=[f"__catalog__{document_id}"])
+        if not fetch_manifest.vectors:
+            return None
 
     for i in range(0, len(ids_to_delete), 1000):
         index.delete(ids=ids_to_delete[i : i + 1000])
@@ -216,66 +240,100 @@ def get_collection_stats() -> dict:
 def list_indexed_documents() -> list[IndexedDocument]:
     index = get_index()
 
-    all_ids: list[str] = []
+    manifest_ids: list[str] = []
     try:
-        for id_batch in index.list():
-            all_ids.extend(id_batch)
+        # List only catalog manifest IDs (e.g. __catalog__...)
+        for id_batch in index.list(prefix="__catalog__"):
+            manifest_ids.extend(id_batch)
     except Exception as e:
-        logger.warning("Error listing Pinecone vectors: %s", e)
-        return []
+        logger.warning("Error listing Pinecone catalog manifests: %s", e)
 
-    if not all_ids:
-        return []
-
-    if not all_ids:
-        return []
-
-    FETCH_BATCH_SIZE = 100
-    document_map: dict[str, dict] = {}
-
-    for i in range(0, len(all_ids), FETCH_BATCH_SIZE):
-        batch = all_ids[i : i + FETCH_BATCH_SIZE]
+    # Fallback to scanning all vectors if no manifests exist (for documents uploaded earlier)
+    if not manifest_ids:
+        all_ids: list[str] = []
         try:
-            fetch_result = index.fetch(ids=batch)
-        except Exception as e:
-            logger.warning("Batch fetch error: %s", e)
-            continue
+            for id_batch in index.list():
+                all_ids.extend(id_batch)
+        except Exception:
+            return []
 
-        for _, vector_data in fetch_result.vectors.items():
-            metadata = vector_data.metadata or {}
-            doc_id = metadata.get("document_id")
-            source_file = metadata.get("source_file")
-            if not doc_id or not source_file:
+        if not all_ids:
+            return []
+
+        FETCH_BATCH_SIZE = 100
+        doc_map: dict[str, dict] = {}
+        for i in range(0, len(all_ids), FETCH_BATCH_SIZE):
+            batch = all_ids[i : i + FETCH_BATCH_SIZE]
+            try:
+                fetch_res = index.fetch(ids=batch)
+            except Exception:
                 continue
 
-            doc_id_str = str(doc_id)
-            entry = document_map.setdefault(
-                doc_id_str,
-                {
-                    "document_id": doc_id_str,
-                    "source_file": str(source_file),
-                    "storage_filename": str(metadata.get("storage_filename", f"{doc_id_str}.pdf")),
+            for _, vec in fetch_res.vectors.items():
+                m = vec.metadata or {}
+                if m.get("is_catalog_manifest"):
+                    continue
+                d_id = m.get("document_id")
+                s_file = m.get("source_file")
+                if not d_id or not s_file:
+                    continue
+                d_str = str(d_id)
+                item = doc_map.setdefault(d_str, {
+                    "document_id": d_str,
+                    "source_file": str(s_file),
+                    "storage_filename": str(m.get("storage_filename", f"{d_str}.pdf")),
                     "chunk_count": 0,
                     "pages": set(),
-                    "size_bytes": metadata.get("size_bytes"),
-                },
-            )
-            entry["chunk_count"] += 1
-            page = metadata.get("page")
-            if isinstance(page, (int, float)):
-                entry["pages"].add(int(page))
+                    "size_bytes": m.get("size_bytes"),
+                })
+                item["chunk_count"] += 1
+                p = m.get("page")
+                if isinstance(p, (int, float)):
+                    item["pages"].add(int(p))
 
-    return [
-        IndexedDocument(
-            document_id=doc_id,
-            source_file=str(d["source_file"]),
-            storage_filename=str(d["storage_filename"]),
-            chunk_count=int(d["chunk_count"]),
-            pages=sorted(d["pages"]),
-            size_bytes=d.get("size_bytes"),
+        return [
+            IndexedDocument(
+                document_id=d_id,
+                source_file=str(d["source_file"]),
+                storage_filename=str(d["storage_filename"]),
+                chunk_count=int(d["chunk_count"]),
+                pages=sorted(d["pages"]),
+                size_bytes=d.get("size_bytes"),
+            )
+            for d_id, d in sorted(doc_map.items(), key=lambda x: str(x[1]["source_file"]).lower())
+        ]
+
+    # Fetch all catalog manifest records in 1 fast call
+    try:
+        fetch_manifests = index.fetch(ids=manifest_ids)
+    except Exception as e:
+        logger.warning("Error fetching catalog manifests: %s", e)
+        return []
+
+    documents: list[IndexedDocument] = []
+    for _, vec in fetch_manifests.vectors.items():
+        meta = vec.metadata or {}
+        doc_id = meta.get("document_id")
+        source_file = meta.get("source_file")
+        if not doc_id or not source_file:
+            continue
+
+        pages_csv = meta.get("pages_csv", "")
+        pages = [int(p) for p in str(pages_csv).split(",") if p.strip().isdigit()]
+
+        documents.append(
+            IndexedDocument(
+                document_id=str(doc_id),
+                source_file=str(source_file),
+                storage_filename=str(meta.get("storage_filename", f"{doc_id}.pdf")),
+                chunk_count=int(meta.get("chunk_count", 0)),
+                pages=sorted(pages),
+                size_bytes=meta.get("size_bytes"),
+            )
         )
-        for doc_id, d in sorted(document_map.items(), key=lambda x: str(x[1]["source_file"]).lower())
-    ]
+
+    documents.sort(key=lambda d: d.source_file.lower())
+    return documents
 
 
 def semantic_search(query: str, top_k: int | None = None) -> list[SearchResult]:
@@ -283,20 +341,21 @@ def semantic_search(query: str, top_k: int | None = None) -> list[SearchResult]:
     k = top_k or settings.search_top_k
 
     index = get_index()
-    stats = index.describe_index_stats()
-    if stats.total_vector_count == 0:
-        return []
-
     query_embedding = get_query_embedding(query)
+    
+    # Query pinecone, filter out any catalog manifests so they never get returned in search
     response = index.query(
         vector=query_embedding,
-        top_k=k,
+        top_k=k + 5, # retrieve extra to account for any manifest filter
         include_metadata=True,
     )
 
     results = []
     for match in response.matches:
         meta = match.metadata or {}
+        # Ignore catalog manifest vectors in search results
+        if meta.get("is_catalog_manifest"):
+            continue
         page_val = meta.get("page")
         results.append(
             SearchResult(
@@ -306,5 +365,7 @@ def semantic_search(query: str, top_k: int | None = None) -> list[SearchResult]:
                 score=float(match.score),
             )
         )
+        if len(results) >= k:
+            break
 
     return results
