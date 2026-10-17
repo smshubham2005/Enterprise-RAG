@@ -2,7 +2,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
-from services.qa_service import answer_question
+from services.qa_service import AIServiceError, answer_question
 from api.auth_router import verify_token
 
 router = APIRouter(
@@ -45,8 +45,10 @@ async def ask_documents(request: AskRequest, username: str = Depends(verify_toke
         # Convert Pydantic ChatMessage history list to list of dicts for qa_service
         history_dicts = [{"role": msg.role, "content": msg.content} for msg in request.history]
         result = await asyncio.to_thread(answer_question, request.query, history=history_dicts, top_k=request.top_k)
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Answer generation failed: {str(error)}")
+    except AIServiceError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.message) from error
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unable to generate an answer at this time. Please try again.")
 
     return AskResponse(
         query=result.query,

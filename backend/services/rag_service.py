@@ -127,32 +127,42 @@ class RAGService:
             raise RuntimeError(f"Failed to chunk documents: {e}")
 
 
-def process_document(file_path: str, filename: str, document_id: str, storage_filename: str) -> ProcessResult:
+def process_document(
+    file_path: str,
+    filename: str,
+    document_id: str,
+    storage_filename: str,
+    size_bytes: int = 0,
+) -> ProcessResult:
     """
-    Public API interface to process a document fully: loader -> splitter -> vector store.
+    Public API: extract → chunk → embed → store in Pinecone.
+    size_bytes is stored as vector metadata so the document list
+    can display file sizes even after the local PDF is deleted.
     """
     settings = get_settings()
     service = RAGService()
-    
+
     # 1. Extract
     docs = service.extract_text_from_pdf(file_path, filename)
-    
+
     # 2. Chunk
     chunks = service.chunk_documents(docs, filename, document_id=document_id)
-    
-    # 3. Store in Vector Store
-    logger.info(f"Storing {len(chunks)} chunks in ChromaDB...")
+
+    # 3. Store in Pinecone
+    logger.info(f"Storing {len(chunks)} chunks in Pinecone...")
     try:
-        stored_count = store_documents(chunks, filename, document_id, storage_filename)
-        logger.info(f"Successfully indexed {stored_count} chunks.")
+        stored_count = store_documents(
+            chunks, filename, document_id, storage_filename, size_bytes=size_bytes
+        )
+        logger.info(f"Successfully indexed {stored_count} chunks in Pinecone.")
     except Exception as e:
-        logger.error(f"Failed to store documents in ChromaDB: {e}")
-        raise RuntimeError(f"ChromaDB write failure: {e}")
-        
+        logger.error(f"Failed to store documents in Pinecone: {e}")
+        raise RuntimeError(f"Pinecone write failure: {e}")
+
     return ProcessResult(
         chunk_count=len(chunks),
         embedding_count=len(chunks),
-        embedding_dimensions=768, # Google embedding-001 vector size
-        collection_name=settings.chroma_collection_name
+        embedding_dimensions=768,  # Gemini embedding-001 output dimension
+        collection_name=settings.pinecone_index_name,
     )
 

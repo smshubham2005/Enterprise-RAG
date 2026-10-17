@@ -18,7 +18,12 @@ langchain==0.2.6
 langchain-community==0.2.6
 langchain-google-genai==1.0.6
 langchain-text-splitters==0.2.2
-langchain-chroma==0.1.1
+langchain-pinecone==0.2.0
+
+# ----------------------------
+# Vector Store (Pinecone - persistent cloud)
+# ----------------------------
+pinecone==5.1.2
 
 # ----------------------------
 # PDF Processing
@@ -30,22 +35,3 @@ pypdf==4.2.0
 # ----------------------------
 pydantic==2.7.4
 pydantic-settings==2.3.4
-
-# =====================================================
-# Testing Dependencies (Milestone 9)
-# =====================================================
-
-# Test Framework
-pytest==7.4.3
-
-# Async test support
-pytest-asyncio==0.21.1
-
-# Mocking utilities
-pytest-mock==3.12.0
-
-# Coverage reports
-pytest-cov==4.1.0
-
-# FastAPI API testing (Phase 2)
-httpx==0.27.0

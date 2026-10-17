@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -5,6 +6,60 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from core.config import get_settings
 from services.vector_store import SearchResult, semantic_search
+
+logger = logging.getLogger(__name__)
+
+
+class AIServiceError(Exception):
+    """Custom exception carrying a user-friendly message and HTTP status code."""
+    def __init__(self, message: str, status_code: int = 500):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(message)
+
+
+def classify_ai_error(error: Exception) -> AIServiceError:
+    """
+    Classify a raw Gemini/network exception into a sanitized, user-friendly error.
+    Logs the full exception detail server-side for debugging.
+    """
+    error_str = str(error).lower()
+    logger.error("AI service error: %s", error, exc_info=True)
+
+    if "429" in error_str or "quota" in error_str or "resource has been exhausted" in error_str or "rate limit" in error_str:
+        return AIServiceError(
+            "The AI service is experiencing high demand. Please wait a moment and try again.",
+            status_code=429,
+        )
+
+    if "503" in error_str or "overloaded" in error_str or "unavailable" in error_str:
+        return AIServiceError(
+            "The AI model is temporarily unavailable. Please retry in a few seconds.",
+            status_code=503,
+        )
+
+    if "401" in error_str or "403" in error_str or "api key" in error_str or "permission" in error_str or "unauthorized" in error_str:
+        return AIServiceError(
+            "AI service authentication failed. Please contact the administrator.",
+            status_code=502,
+        )
+
+    if "timeout" in error_str or "timed out" in error_str or "deadline" in error_str:
+        return AIServiceError(
+            "The AI service took too long to respond. Please try a shorter question or try again.",
+            status_code=504,
+        )
+
+    if "connection" in error_str or "network" in error_str or "socket" in error_str or "refused" in error_str:
+        return AIServiceError(
+            "Could not connect to the AI service. Please check your connection and try again.",
+            status_code=502,
+        )
+
+    return AIServiceError(
+        "Unable to generate an answer at this time. Please try again.",
+        status_code=500,
+    )
 
 
 @dataclass
@@ -42,91 +97,96 @@ def answer_question(
     Generate a grounded answer from the most relevant document chunks.
     """
 
-    history_list = history or []
+    try:
+        history_list = history or []
 
-    # Only condense follow-up questions when history exists AND condensation is required
-    if history_list and _should_condense_query(query):
-        search_query = _condense_query(query, history_list)
-    else:
-        search_query = query
+        # Only condense follow-up questions when history exists AND condensation is required
+        if history_list and _should_condense_query(query):
+            search_query = _condense_query(query, history_list)
+        else:
+            search_query = query
 
-    # Determine retrieval depth based on query type
-    summary_keywords = [
-        "summarize",
-        "summary",
-        "overview",
-        "main points",
-        "key points",
-        "important points",
-        "main topics",
-    ]
-
-    effective_top_k = top_k
-
-    if effective_top_k is None:
-        effective_top_k = (
-            10
-            if any(
-                keyword in search_query.lower()
-                for keyword in summary_keywords
-            )
-            else 4
-        )
-
-    search_results = semantic_search(
-        search_query,
-        top_k=effective_top_k,
-    )
-
-    sources = [
-        SourceSnippet(
-            content=result.content,
-            source_file=result.source_file,
-            page=result.page,
-            score=result.score,
-        )
-        for result in search_results
-    ]
-
-    if not search_results:
-        return AnswerResult(
-            query=query,
-            answer="I could not find any relevant document context to answer this question.",
-            source_count=0,
-            sources=[],
-        )
-
-    prompt = _build_grounded_prompt(
-        query,
-        search_results,
-        history_list,
-    )
-
-    response = get_chat_model().invoke(prompt)
-
-    answer = (
-    response.content
-    if isinstance(response.content, str)
-    else str(response.content)
-    ).strip()
-
-    no_answer_phrases = [
-    "do not contain enough information",
-    "not enough information",
-    "cannot answer",
-    "can't answer",
-    "unable to answer",
+        # Determine retrieval depth based on query type
+        summary_keywords = [
+            "summarize",
+            "summary",
+            "overview",
+            "main points",
+            "key points",
+            "important points",
+            "main topics",
         ]
 
-    if any(phrase in answer.lower() for phrase in no_answer_phrases):
-        sources = []
+        effective_top_k = top_k
 
-    return AnswerResult(
-    query=query,
-    answer=answer,
-    source_count=len(sources),
-    sources=sources,
-    )
+        if effective_top_k is None:
+            effective_top_k = (
+                10
+                if any(
+                    keyword in search_query.lower()
+                    for keyword in summary_keywords
+                )
+                else 4
+            )
+
+        search_results = semantic_search(
+            search_query,
+            top_k=effective_top_k,
+        )
+
+        sources = [
+            SourceSnippet(
+                content=result.content,
+                source_file=result.source_file,
+                page=result.page,
+                score=result.score,
+            )
+            for result in search_results
+        ]
+
+        if not search_results:
+            return AnswerResult(
+                query=query,
+                answer="I could not find any relevant document context to answer this question.",
+                source_count=0,
+                sources=[],
+            )
+
+        prompt = _build_grounded_prompt(
+            query,
+            search_results,
+            history_list,
+        )
+
+        response = get_chat_model().invoke(prompt)
+
+        answer = (
+            response.content
+            if isinstance(response.content, str)
+            else str(response.content)
+        ).strip()
+
+        no_answer_phrases = [
+            "do not contain enough information",
+            "not enough information",
+            "cannot answer",
+            "can't answer",
+            "unable to answer",
+        ]
+
+        if any(phrase in answer.lower() for phrase in no_answer_phrases):
+            sources = []
+
+        return AnswerResult(
+            query=query,
+            answer=answer,
+            source_count=len(sources),
+            sources=sources,
+        )
+    except AIServiceError:
+        raise
+    except Exception as error:
+        raise classify_ai_error(error) from error
 
 
 REFERENTIAL_PATTERNS = {

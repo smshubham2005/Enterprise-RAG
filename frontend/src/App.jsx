@@ -399,6 +399,13 @@ function App() {
 
     requestAnimationFrame(() => textareaRef.current?.focus())
 
+    // Abort after 50 s; update loading message after 15 s to warn about cold-start
+    const controller = new AbortController()
+    const hardTimeout = setTimeout(() => controller.abort(), 50_000)
+    const slowWarning = setTimeout(() => {
+      setLoadingMessage('Still working — the server may be waking up. Please wait...')
+    }, 15_000)
+
     try {
       const response = await fetch(`${API_BASE_URL}/ask`, {
         method: 'POST',
@@ -407,6 +414,7 @@ function App() {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ query: userQuery, top_k: topK, history: historyPayload }),
+        signal: controller.signal,
       })
       const payload = await readJsonSafely(response)
       if (!response.ok) {
@@ -415,11 +423,19 @@ function App() {
       }
       setMessages((prev) => [...prev, { role: 'assistant', content: payload?.answer || 'I could not generate a response right now.', sources: payload?.sources || [] }])
     } catch (requestError) {
-      const message = requestError instanceof Error ? requestError.message : 'The assistant could not answer right now.'
-      setError(message === 'Failed to fetch' ? 'The assistant is temporarily unavailable. Please try again in a moment.' : message)
+      const isTimeout = requestError?.name === 'AbortError'
+      const rawMessage = requestError instanceof Error ? requestError.message : ''
+      const message = isTimeout
+        ? 'The request timed out. The server may be starting up — please try again in a moment.'
+        : rawMessage === 'Failed to fetch'
+          ? 'The assistant is temporarily unavailable. Please try again in a moment.'
+          : rawMessage || 'The assistant could not answer right now.'
+      setError(message)
       setMessages((prev) => prev.slice(0, -1))
       setQuery(userQuery)
     } finally {
+      clearTimeout(hardTimeout)
+      clearTimeout(slowWarning)
       setIsLoading(false)
       requestAnimationFrame(() => textareaRef.current?.focus())
     }
@@ -703,7 +719,7 @@ function App() {
                   <article className="source-card" key={idx}>
                     <header>
                       <span className="source-index">Source {idx + 1}</span>
-                      <span className="source-score">Match distance {source.score.toFixed(4)}</span>
+                      <span className="source-score">Similarity {(source.score * 100).toFixed(1)}%</span>
                     </header>
                     <p className="source-location">{source.source_file || 'Unknown File'}{source.page !== null && `, page ${source.page}`}</p>
                     <p className="source-text">{source.content}</p>
@@ -720,7 +736,7 @@ function App() {
             <header>
               <p className="eyebrow">Enterprise RAG Assistant</p>
               <h1>Case access</h1>
-              <p className="muted-login">Sign in with the shared credential - password: <strong>Admin@1234</strong></p>
+              <p className="muted-login">Sign in to access the knowledge base.</p>
             </header>
             {loginError && <div className="error-box compact" role="alert">{loginError}</div>}
             <form onSubmit={handleLogin}>
@@ -732,10 +748,7 @@ function App() {
                 <label htmlFor="password">Password</label>
                 <input id="password" type="password" required value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Enter password" autoComplete="current-password" />
               </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button type="submit">Sign in</button>
-                <button type="button" onClick={() => { setLoginUser('admin'); setLoginPass('Admin@1234'); }}>Fill</button>
-              </div>
+              <button type="submit">Sign in</button>
             </form>
           </div>
         </div>

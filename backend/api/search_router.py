@@ -1,8 +1,9 @@
 import asyncio
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
 from services.vector_store import semantic_search
+from api.auth_router import verify_token
 
 router = APIRouter(
     prefix="/search",
@@ -29,7 +30,7 @@ class SearchResponse(BaseModel):
 
 
 @router.post("", response_model=SearchResponse)
-async def search_documents(request: SearchRequest):
+async def search_documents(request: SearchRequest, username: str = Depends(verify_token)):
     """
     Semantic search over ingested document chunks.
     Returns the most relevant text passages ranked by similarity.
