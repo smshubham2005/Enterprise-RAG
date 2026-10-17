@@ -215,13 +215,17 @@ def get_collection_stats() -> dict:
 
 def list_indexed_documents() -> list[IndexedDocument]:
     index = get_index()
-    stats = index.describe_index_stats()
-    if stats.total_vector_count == 0:
-        return []
 
     all_ids: list[str] = []
-    for id_batch in index.list():
-        all_ids.extend(id_batch)
+    try:
+        for id_batch in index.list():
+            all_ids.extend(id_batch)
+    except Exception as e:
+        logger.warning("Error listing Pinecone vectors: %s", e)
+        return []
+
+    if not all_ids:
+        return []
 
     if not all_ids:
         return []
