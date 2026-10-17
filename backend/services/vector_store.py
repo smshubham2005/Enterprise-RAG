@@ -11,15 +11,29 @@ from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Gemini embedding-001 output vector dimensions
-EMBEDDING_DIMENSION = 768
-
 _index_ready: bool = False
+_detected_dimension: int | None = None
 
 
 # ==============================================================
 # Embeddings via Gemini
 # ==============================================================
+
+def get_detected_dimension() -> int:
+    """Measure the exact dimension output by the configured embedding model."""
+    global _detected_dimension
+    if _detected_dimension is None:
+        settings = get_settings()
+        genai.configure(api_key=settings.gemini_api_key)
+        sample = genai.embed_content(
+            model=settings.embedding_model,
+            content="test",
+            task_type="retrieval_document",
+        )["embedding"]
+        _detected_dimension = len(sample)
+        logger.info("Detected embedding model dimension: %d", _detected_dimension)
+    return _detected_dimension
+
 
 def get_gemini_embeddings(texts: list[str]) -> list[list[float]]:
     settings = get_settings()
@@ -83,19 +97,36 @@ def _ensure_index_exists() -> None:
 
     settings = get_settings()
     pc = get_pinecone_client()
-    existing = [idx.name for idx in pc.list_indexes()]
+    target_dim = get_detected_dimension()
+    
+    existing_indexes = {idx.name: idx for idx in pc.list_indexes()}
 
-    if settings.pinecone_index_name not in existing:
-        logger.info("Creating Pinecone index '%s'...", settings.pinecone_index_name)
+    if settings.pinecone_index_name in existing_indexes:
+        existing_info = existing_indexes[settings.pinecone_index_name]
+        # If dimension mismatch, delete and recreate with matching dimension
+        if existing_info.dimension != target_dim:
+            logger.warning(
+                "Pinecone index dimension mismatch (found %d, model outputs %d). Recreating index...",
+                existing_info.dimension,
+                target_dim,
+            )
+            pc.delete_index(settings.pinecone_index_name)
+            pc.create_index(
+                name=settings.pinecone_index_name,
+                dimension=target_dim,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            )
+            logger.info("Pinecone index recreated with dimension %d.", target_dim)
+    else:
+        logger.info("Creating Pinecone index '%s' with dimension %d...", settings.pinecone_index_name, target_dim)
         pc.create_index(
             name=settings.pinecone_index_name,
-            dimension=EMBEDDING_DIMENSION,
+            dimension=target_dim,
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
         logger.info("Pinecone index '%s' created.", settings.pinecone_index_name)
-    else:
-        logger.info("Pinecone index '%s' is ready.", settings.pinecone_index_name)
 
     _index_ready = True
 
